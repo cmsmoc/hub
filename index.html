@@ -940,13 +940,44 @@ body {
 
 <script>
 // ── CONFIG ────────────────────────────────────────────────────
-const CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS1BqTDWR2NtVv_9a7lQpSn9bE218sImeEqXNQ5b9yDBpJrRdZh9gmIjORgAzfyesOnDsK90R65DR08/pub?gid=765582481&single=true&output=csv';
+// FONTE DE DADOS: apenas CSV público — sem CORS, sem problema.
+// O Apps Script NÃO suporta fetch() cross-origin. Usamos:
+//   • Leitura  → CSV público (abaixo)
+//   • Escrita  → JSONP via <script src> (ver gasJSONP)
+const CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vS1BqTDWR2NtVv_9a7lQpSn9bE218sImeEqXNQ5b9yDBpJrRdZh9gmIjORgAzfyesOnDsK90R65DR08/pub?gid=0&single=true&output=csv';
 
-// Para usar a API completa (doGet do Apps Script), defina a URL abaixo:
-// const API_URL = 'https://script.google.com/macros/s/AKfycbyzeY0k7BKkitHv8iuwDk6ONZ4yhAPzUNnNakYqiXKIaWtxNneLkcn_tDm-zD129EW7-g/exec';
+// Quando publicar a Web App, cole a URL aqui para ativar registro de leads:
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbyzeY0k7BKkitHv8iuwDk6ONZ4yhAPzUNnNakYqiXKIaWtxNneLkcn_tDm-zD129EW7-g/exec'; // ex: 'https://script.google.com/macros/s/SEU_ID/exec'
+
+// ── JSONP HELPER (contorna CORS do Apps Script) ───────────────
+// Usado para ESCREVER dados (leads) sem fetch() cross-origin.
+function gasJSONP(acao, dados, onSuccess, onError) {
+  if (!GAS_URL) { if (onSuccess) onSuccess({ ok: true }); return; }
+  const fn = 'cb_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+  const tid = setTimeout(() => {
+    delete window[fn];
+    const el = document.getElementById('_gs_' + fn);
+    if (el) el.remove();
+    if (onError) onError('Timeout');
+  }, 8000);
+  window[fn] = function(res) {
+    clearTimeout(tid);
+    delete window[fn];
+    const el = document.getElementById('_gs_' + fn);
+    if (el) el.remove();
+    if (onSuccess) onSuccess(res);
+  };
+  const params = encodeURIComponent(JSON.stringify({ acao, dados }));
+  const s = document.createElement('script');
+  s.id  = '_gs_' + fn;
+  s.src = GAS_URL + '?acao=' + acao + '&dados=' + params + '&callback=' + fn + '&t=' + Date.now();
+  s.onerror = () => { clearTimeout(tid); delete window[fn]; s.remove(); if (onError) onError('Script load error'); };
+  document.body.appendChild(s);
+}
 
 // ── STATE ─────────────────────────────────────────────────────
 let _allItems   = [];
+let _itemMap    = {};   // id → item (para lookup seguro no onclick)
 let _categorias = [];
 let _paginas    = [];
 let _config     = {};
@@ -980,6 +1011,15 @@ async function carregarCSV() {
         return obj;
       })
       .filter(item => item.ativo === 'true' || item.ativo === 'TRUE');
+
+    // Índice seguro para lookup no onclick (evita JSON inline no HTML)
+    _itemMap = {};
+    _allItems.forEach((item, idx) => {
+      // Usa índice numérico como chave caso id esteja vazio
+      const key = item.id || String(idx);
+      item._key = key;
+      _itemMap[key] = item;
+    });
 
     _categorias = [...new Set(_allItems.map(i => i.categoria).filter(Boolean))];
 
@@ -1124,7 +1164,7 @@ function renderCard(item, wide=false) {
     : '';
 
   return `
-    <div class="card${wide?' card-wide':''}" onclick="acessarItem(${JSON.stringify(JSON.stringify(item))})">
+    <div class="card${wide?' card-wide':''}" onclick="acessarItem('${esc(item._key)}'">
       <div class="card-thumb">
         ${thumbHtml}
         <div class="card-thumb-placeholder" style="${thumb?'display:none':''}">
@@ -1155,8 +1195,9 @@ function renderCard(item, wide=false) {
 }
 
 // ── ACESSO ────────────────────────────────────────────────────
-function acessarItem(itemJson) {
-  const item = JSON.parse(itemJson);
+function acessarItem(key) {
+  const item = _itemMap[key];
+  if (!item) { console.error('Item não encontrado:', key); return; }
   const isProtegido = item.protegido === 'true' || item.protegido === 'TRUE';
 
   if (isProtegido && item.senha) {
@@ -1167,8 +1208,7 @@ function acessarItem(itemJson) {
     return;
   }
 
-  // Verificar se cadastro está ativo (via config)
-  // Para ativar: defina cadastro_ativo = true na planilha config
+  // Para ativar cadastro obrigatório: defina cadastro_ativo = true na aba config
   // if (_config.cadastro_ativo === 'true' && isProtegido) { ... }
 
   window.open(item.url, '_blank', 'noopener,noreferrer');
@@ -1186,10 +1226,26 @@ function submitSenha() {
 }
 
 function submitLead() {
-  const nome  = document.getElementById('lead-nome').value.trim();
-  const email = document.getElementById('lead-email').value.trim();
+  const nome     = document.getElementById('lead-nome').value.trim();
+  const email    = document.getElementById('lead-email').value.trim();
+  const segmento = document.getElementById('lead-segmento').value;
+  const municipio= document.getElementById('lead-municipio').value.trim();
+  const telefone = document.getElementById('lead-telefone').value.trim();
+
   if (!nome || !email) { alert('Nome e e-mail são obrigatórios.'); return; }
-  // Registrar via API se disponível
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { alert('E-mail inválido.'); return; }
+
+  const dados = {
+    nome, email, segmento, municipio, telefone,
+    conteudo_id: _itemPendente ? (_itemPendente.id || '') : ''
+  };
+
+  // Registra via JSONP (sem fetch, sem CORS) se GAS_URL estiver configurado
+  gasJSONP('registrar_acesso', dados,
+    () => { /* sucesso silencioso */ },
+    (err) => { console.warn('Lead não registrado:', err); }
+  );
+
   fecharOverlay('overlay-lead');
   if (_itemPendente) {
     window.open(_itemPendente.url, '_blank', 'noopener,noreferrer');
